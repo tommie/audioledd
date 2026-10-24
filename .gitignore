@@ -1,0 +1,6 @@
+debian/.debhelper/
+debian/audioledd/
+debian/audioledd.substvars
+debian/debhelper-build-stamp
+debian/files
+debian/*.debhelper*

@@ -1,0 +1,22 @@
+[Unit]
+Description=Mute LEDs following the default audio devices
+Documentation=file:///usr/share/doc/audioledd/README.md
+After=systemd-logind.service
+
+[Service]
+ExecStart=/usr/sbin/audioledd
+# The daemon resets on clean exit, but not if it's killed.
+ExecStopPost=/usr/sbin/audioledd --reset
+Restart=on-failure
+RestartSec=5
+
+# Root is only needed for writing /sys/class/sound/ctl-led/*/mode (owned by
+# root) and for running pactl as the session user.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_KILL
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

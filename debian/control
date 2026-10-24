@@ -1,0 +1,16 @@
+Source: audioledd
+Section: sound
+Priority: optional
+Maintainer: Tommie Gannert <tommie.gh@gannert.se>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+
+Package: audioledd
+Architecture: all
+Depends: ${misc:Depends}, python3, python3-gi, gir1.2-glib-2.0 (>= 2.80), pulseaudio-utils (>= 16), systemd
+Description: mute LEDs following the default audio devices
+ The kernel only lights the speaker and mic mute LEDs for ALSA sound cards.
+ This daemon makes them follow the default sink and source of the active
+ seat session instead, so muting e.g. a Bluetooth headset lights them too.
+ When the default device is the built-in card, the kernel stays in control.

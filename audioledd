@@ -1,0 +1,370 @@
+#!/usr/bin/python3
+"""Make the speaker and mic mute LEDs follow the default audio devices.
+
+The kernel's audio-mute/audio-micmute LED triggers are fed by snd-ctl-led,
+which only sees ALSA mixer controls. When the default sink or source is e.g.
+a Bluetooth headset, muting it never reaches ALSA, so the LEDs stay dark.
+
+Rather than taking over the LEDs (trigger=none, writing brightness), we
+switch the snd-ctl-led group mode in /sys/class/sound/ctl-led/*/mode:
+
+  * Default device is on a card attached to the LED group: "follow-mute",
+    i.e. the kernel drives the LED exactly as it would without us.
+  * Anything else: "on" or "off", mirroring the device's mute state.
+
+This keeps the LED triggers untouched, so if we die, the LEDs keep working
+for the built-in card. Writing 0 to an LED's brightness would silently
+remove its trigger, which is why we don't do that.
+
+The mode files are root-only, and sysfs doesn't support the ACLs logind
+uses to grant seat access to /dev nodes. So this runs as a system service
+that follows the active session of a seat through logind, and runs pactl as
+that session's user. Only the sysfs writes happen as root.
+"""
+
+import argparse
+import json
+import logging
+import os
+import pwd
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gio", "2.0")
+gi.require_version("GLibUnix", "2.0")
+from gi.repository import Gio, GLib, GLibUnix  # noqa: E402
+
+LOGIND = "org.freedesktop.login1"
+
+GROUPS = ("speaker", "mic")
+
+# How long to wait for more events before evaluating. A single mute toggle
+# yields both a sink and a card event.
+COALESCE_MS = 50
+
+# How long to wait before reconnecting when the sound server is missing or
+# went away, e.g. during login or a pipewire-pulse restart.
+RETRY_S = 5
+
+# Our own pactl calls produce client events, so we must not react to those.
+# Card events cover profile switches (e.g. A2DP <-> HFP).
+RELEVANT_FACILITIES = (" on sink ", " on source ", " on server", " on card ")
+
+
+class Leds:
+    """Writes snd-ctl-led group modes."""
+
+    def __init__(self, ctl_led_dir, dry_run):
+        self._dir = Path(ctl_led_dir)
+        self._dry_run = dry_run
+        # In dry-run mode we never write, so remember what we would have
+        # written to avoid repeating ourselves.
+        self._modes = {}
+
+        for group in GROUPS:
+            mode = self._mode_path(group)
+            if not mode.exists():
+                raise SystemExit(f"{mode} doesn't exist; is snd-ctl-led loaded?")
+            if not dry_run and not os.access(mode, os.W_OK):
+                raise SystemExit(f"{mode} isn't writable; run as root or with -n")
+
+    def _mode_path(self, group):
+        return self._dir / group / "mode"
+
+    def attached_cards(self, group):
+        """Returns the ALSA card numbers with controls attached to the group.
+
+        The kernel creates a cardN directory per attached card.
+        """
+        return {p.name.removeprefix("card") for p in (self._dir / group).glob("card*")}
+
+    def set_mode(self, group, mode):
+        cur = self._modes.get(group) or self._mode_path(group).read_text().strip()
+        if cur == mode:
+            return
+
+        if self._dry_run:
+            logging.info("Would set %s: %s -> %s", group, cur, mode)
+            self._modes[group] = mode
+            return
+
+        logging.info("%s: %s -> %s", group, cur, mode)
+        self._mode_path(group).write_text(mode + "\n")
+
+    def reset(self):
+        for group in GROUPS:
+            self.set_mode(group, "follow-mute")
+
+
+class PulseUser:
+    """Runs pactl as a given user, against that user's sound server."""
+
+    def __init__(self, uid):
+        pw = pwd.getpwuid(uid)
+        self.uid = uid
+        self.name = pw.pw_name
+        self._gid = pw.pw_gid
+        self._env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": pw.pw_dir,
+            "USER": pw.pw_name,
+            "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+            # pactl output is parsed, so don't localize it.
+            "LC_ALL": "C",
+        }
+
+    def _priv_args(self):
+        # Allows running unprivileged against one's own session, e.g. for
+        # dry runs.
+        if os.getuid() == self.uid:
+            return {}
+        return {"user": self.uid, "group": self._gid, "extra_groups": []}
+
+    def popen(self, *args):
+        return subprocess.Popen(
+            ["pactl", *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            env=self._env,
+            **self._priv_args(),
+        )
+
+    def json(self, *args):
+        out = subprocess.run(
+            ["pactl", "-f", "json", *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            env=self._env,
+            text=True,
+            timeout=5,
+            check=True,
+            **self._priv_args(),
+        )
+        return json.loads(out.stdout)
+
+
+class Daemon:
+    def __init__(self, leds, seat):
+        self._leds = leds
+        self._bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+        self._user = None
+        self._sub = None
+        self._sub_watch = None
+        self._sub_buf = b""
+        # Whether the current user's sound server has answered. Until then,
+        # failures are expected, e.g. in a TTY session, and we retry quietly.
+        self._connected = False
+        self._pending_update = None
+        self._pending_retry = None
+
+        self._seat = Gio.DBusProxy.new_sync(
+            self._bus,
+            Gio.DBusProxyFlags.NONE,
+            None,
+            LOGIND,
+            self._seat_path(seat),
+            "org.freedesktop.login1.Seat",
+        )
+        self._seat.connect("g-properties-changed", self._on_seat_changed)
+
+    def _seat_path(self, seat):
+        return self._bus.call_sync(
+            LOGIND,
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+            "GetSeat",
+            GLib.Variant("(s)", (seat,)),
+            GLib.VariantType("(o)"),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+        ).unpack()[0]
+
+    def start(self):
+        self._follow_session()
+
+    def stop(self):
+        self._stop_subscription()
+        self._leds.reset()
+
+    def _on_seat_changed(self, proxy, changed, invalidated):
+        if "ActiveSession" in changed.keys() or "ActiveSession" in invalidated:
+            self._follow_session()
+
+    def _active_uid(self):
+        # The seat proxy caches properties, and is kept up to date by
+        # PropertiesChanged.
+        active = self._seat.get_cached_property("ActiveSession")
+        if active is None:
+            return None
+        _, path = active.unpack()
+        if path == "/":
+            return None
+
+        session = Gio.DBusProxy.new_sync(
+            self._bus,
+            Gio.DBusProxyFlags.DO_NOT_CONNECT_SIGNALS,
+            None,
+            LOGIND,
+            path,
+            "org.freedesktop.login1.Session",
+        )
+        uid, _ = session.get_cached_property("User").unpack()
+        return uid
+
+    def _follow_session(self):
+        uid = self._active_uid()
+        if self._user and self._user.uid == uid and self._sub:
+            return
+
+        self._stop_subscription()
+        self._user = PulseUser(uid) if uid is not None else None
+
+        if self._user is None:
+            logging.info("No active session")
+            self._leds.reset()
+            return
+
+        logging.info("Following %s", self._user.name)
+        self._connected = False
+        self._start_subscription()
+
+    def _start_subscription(self):
+        # Start listening before the first evaluation, so no change can slip
+        # between them.
+        self._sub = self._user.popen("subscribe")
+        self._sub_buf = b""
+        self._sub_watch = GLib.io_add_watch(
+            self._sub.stdout.fileno(),
+            GLib.PRIORITY_DEFAULT,
+            GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
+            self._on_sub_readable,
+        )
+        self._update()
+
+    def _stop_subscription(self):
+        for source in (self._sub_watch, self._pending_update, self._pending_retry):
+            if source:
+                GLib.source_remove(source)
+        self._sub_watch = self._pending_update = self._pending_retry = None
+
+        if self._sub:
+            self._sub.terminate()
+            self._sub.wait()
+            self._sub.stdout.close()
+            self._sub = None
+
+    def _on_sub_readable(self, fd, condition):
+        # Read the raw fd rather than lines from a buffered stream: lines left
+        # in a userspace buffer wouldn't wake us up again.
+        data = os.read(fd, 4096) if condition & GLib.IOCondition.IN else b""
+        if not data:
+            # pactl exits when the sound server goes away, or if it wasn't
+            # running yet, e.g. right after login.
+            self._log_failure("pactl subscribe for %s exited", self._user.name)
+            self._sub_watch = None
+            self._stop_subscription()
+            self._leds.reset()
+            self._pending_retry = GLib.timeout_add_seconds(RETRY_S, self._on_retry)
+            return GLib.SOURCE_REMOVE
+
+        *lines, self._sub_buf = (self._sub_buf + data).split(b"\n")
+        relevant = any(f in line.decode(errors="replace") for line in lines for f in RELEVANT_FACILITIES)
+        if relevant and not self._pending_update:
+            self._pending_update = GLib.timeout_add(COALESCE_MS, self._on_update_timeout)
+
+        return GLib.SOURCE_CONTINUE
+
+    def _on_retry(self):
+        self._pending_retry = None
+        self._follow_session()
+        return GLib.SOURCE_REMOVE
+
+    def _on_update_timeout(self):
+        self._pending_update = None
+        self._update()
+        return GLib.SOURCE_REMOVE
+
+    def _update(self):
+        try:
+            info = self._user.json("info")
+            self._update_group("speaker", "sinks", info.get("default_sink_name"))
+            self._update_group("mic", "sources", info.get("default_source_name"))
+        except (subprocess.SubprocessError, json.JSONDecodeError) as ex:
+            # The subscription notices if the server is gone, so a failed
+            # query is only reported.
+            self._log_failure("Querying %s's sound server failed: %s", self._user.name, ex)
+            return
+
+        if not self._connected:
+            logging.info("Connected to %s's sound server", self._user.name)
+            self._connected = True
+
+    def _log_failure(self, msg, *args):
+        if self._connected:
+            logging.warning(msg, *args)
+            self._connected = False
+        else:
+            logging.debug(msg, *args)
+
+    def _update_group(self, group, kind, name):
+        dev = None
+        if name:
+            dev = next((d for d in self._user.json("list", kind) if d["name"] == name), None)
+
+        if dev is None:
+            # No default, or it names a device that has just been removed. A
+            # server change event follows when the default is updated.
+            logging.debug("%s: default %s not found", group, name)
+            self._leds.set_mode(group, "follow-mute")
+            return
+
+        card = dev.get("properties", {}).get("alsa.card")
+        logging.debug("%s: default=%s card=%s mute=%s", group, name, card, dev["mute"])
+
+        if card is not None and card in self._leds.attached_cards(group):
+            self._leds.set_mode(group, "follow-mute")
+        elif dev["mute"]:
+            self._leds.set_mode(group, "on")
+        else:
+            self._leds.set_mode(group, "off")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("-n", "--dry-run", action="store_true", help="log mode changes instead of writing them")
+    parser.add_argument("-v", "--verbose", action="store_true", help="log every evaluation")
+    parser.add_argument("--seat", default="seat0", help="the logind seat to follow (default: %(default)s)")
+    parser.add_argument("--reset", action="store_true", help="set all LED groups back to follow-mute and exit")
+    parser.add_argument("--ctl-led-dir", default="/sys/class/sound/ctl-led", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
+    leds = Leds(args.ctl_led_dir, args.dry_run)
+    if args.reset:
+        leds.reset()
+        return
+
+    loop = GLib.MainLoop()
+    daemon = Daemon(leds, args.seat)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        GLibUnix.signal_add(GLib.PRIORITY_HIGH, sig, loop.quit)
+
+    daemon.start()
+    try:
+        loop.run()
+    finally:
+        # Leave the LEDs to the kernel when we stop.
+        daemon.stop()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
